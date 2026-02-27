@@ -77,4 +77,39 @@ class LLMSettings(AumOSSettings):
         description="Maximum number of retries for failed provider requests",
     )
 
+    # Semantic caching
+    enable_semantic_caching: bool = Field(
+        default=False,
+        description="Enable semantic similarity-based LLM response caching",
+    )
+    semantic_cache_similarity_threshold: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        description="Cosine similarity threshold for semantic cache hits [0.0, 1.0]",
+    )
+    semantic_cache_default_ttl_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description="Default TTL for semantic cache entries in seconds (0 = no expiry)",
+    )
+
+    # Complexity-based routing
+    enable_complexity_routing: bool = Field(
+        default=False,
+        description="Enable prompt-complexity-based model tier routing",
+    )
+    complexity_routing_local_model: str = Field(
+        default="ollama/llama3.2",
+        description="Model ID used for simple prompts (complexity score 0.0–0.3)",
+    )
+    complexity_routing_mid_model: str = Field(
+        default="gpt-4o-mini",
+        description="Model ID used for moderate prompts (complexity score 0.3–0.7)",
+    )
+    complexity_routing_premium_model: str = Field(
+        default="claude-opus-4",
+        description="Model ID used for complex prompts (complexity score 0.7–1.0)",
+    )
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_LLM__")
