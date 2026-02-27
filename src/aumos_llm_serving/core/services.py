@@ -36,11 +36,16 @@ from aumos_llm_serving.api.schemas import (
     TextCompletionResponse,
 )
 from aumos_llm_serving.core.interfaces import (
+    BatchSchedulerProtocol,
     CostTrackerProtocol,
     LLMProviderProtocol,
+    MetricsCollectorProtocol,
+    ModelLoaderProtocol,
     ModelRouterProtocol,
     RateLimiterProtocol,
+    StreamHandlerProtocol,
 )
+from aumos_llm_serving.adapters.metrics_collector import RequestTrace
 from aumos_llm_serving.settings import LLMSettings
 
 logger = get_logger(__name__)
@@ -807,3 +812,156 @@ class ModelManagementService:
         )
 
         return TenantQuotaResponse.model_validate(quota)
+
+
+class ModelServingOrchestrator:
+    """High-level orchestrator that wires all domain adapters together.
+
+    Sits above ServingService and adds model loading lifecycle management,
+    batch scheduling, SSE stream handling, quantization profiling, and
+    metrics collection. All new adapters are injected via constructor for
+    testability and provider-agnosticism.
+
+    Typical production wiring:
+
+        orchestrator = ModelServingOrchestrator(
+            serving_service=serving_service,
+            model_loader=ModelLoader(model_root="/models"),
+            batch_scheduler=BatchScheduler(inference_fn=vllm_runner),
+            stream_handler=StreamHandler(default_timeout_seconds=120),
+            metrics_collector=InferenceMetricsCollector(),
+        )
+        await orchestrator.start()
+    """
+
+    def __init__(
+        self,
+        serving_service: ServingService,
+        model_loader: ModelLoaderProtocol | None = None,
+        batch_scheduler: BatchSchedulerProtocol | None = None,
+        stream_handler: StreamHandlerProtocol | None = None,
+        metrics_collector: MetricsCollectorProtocol | None = None,
+    ) -> None:
+        """Initialize the orchestrator with all domain adapters.
+
+        Args:
+            serving_service: Core serving service for LLM calls.
+            model_loader: Model lifecycle manager (optional — for self-hosted).
+            batch_scheduler: Dynamic batch scheduler (optional — for high-throughput).
+            stream_handler: SSE stream manager (optional — for streaming endpoints).
+            metrics_collector: Performance metrics collector (optional).
+        """
+        self._serving_service = serving_service
+        self._model_loader = model_loader
+        self._batch_scheduler = batch_scheduler
+        self._stream_handler = stream_handler
+        self._metrics_collector = metrics_collector
+
+    async def start(self) -> None:
+        """Start all background components.
+
+        Starts the batch scheduler worker if one is configured.
+        """
+        if self._batch_scheduler is not None:
+            await self._batch_scheduler.start()
+            logger.info("BatchScheduler started via orchestrator")
+
+    async def stop(self) -> None:
+        """Stop all background components gracefully."""
+        if self._batch_scheduler is not None:
+            await self._batch_scheduler.stop()
+            logger.info("BatchScheduler stopped via orchestrator")
+
+    async def chat_completion_with_metrics(
+        self,
+        request: ChatCompletionRequest,
+        tenant_id: uuid.UUID,
+    ) -> ChatCompletionResponse:
+        """Execute a chat completion and record performance metrics.
+
+        Delegates to ServingService and wraps the call with request tracing
+        for the MetricsCollector.
+
+        Args:
+            request: OpenAI-compatible chat completion request.
+            tenant_id: Tenant making the request.
+
+        Returns:
+            OpenAI-compatible chat completion response.
+        """
+        enqueued_at = time.monotonic()
+        started_at = time.monotonic()
+        first_token_at: float | None = None
+        request_id = uuid.uuid4()
+        status = "success"
+        error_code: str | None = None
+        response: ChatCompletionResponse | None = None
+
+        try:
+            response = await self._serving_service.chat_completion(request, tenant_id)
+        except Exception as exc:
+            status = "error"
+            error_code = type(exc).__name__
+            raise
+        finally:
+            completed_at = time.monotonic()
+            if self._metrics_collector is not None:
+                usage = getattr(response, "usage", None)
+                trace = RequestTrace(
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    model=request.model,
+                    provider="routed",
+                    enqueued_at=enqueued_at,
+                    started_at=started_at,
+                    first_token_at=first_token_at,
+                    completed_at=completed_at,
+                    prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                    completion_tokens=getattr(usage, "completion_tokens", 0),
+                    status=status,
+                    error_code=error_code,
+                )
+                self._metrics_collector.record_request(trace)
+
+        return response  # type: ignore[return-value]
+
+    def get_system_status(self) -> dict[str, Any]:
+        """Return a consolidated system status snapshot.
+
+        Returns:
+            Dict with loaded models, active streams, batch queue metrics,
+            and aggregated throughput.
+        """
+        status: dict[str, Any] = {
+            "loaded_models": (
+                self._model_loader.list_loaded_models()
+                if self._model_loader is not None
+                else []
+            ),
+            "vram_usage": (
+                self._model_loader.get_vram_usage()
+                if self._model_loader is not None
+                else {}
+            ),
+            "active_streams": (
+                self._stream_handler.list_active_streams()  # type: ignore[union-attr]
+                if self._stream_handler is not None
+                else []
+            ),
+            "batch_metrics": (
+                self._batch_scheduler.get_metrics()
+                if self._batch_scheduler is not None
+                else {}
+            ),
+        }
+        return status
+
+    def get_prometheus_metrics(self) -> str:
+        """Export Prometheus-compatible metrics from the collector.
+
+        Returns:
+            Prometheus text format string, or empty string if no collector.
+        """
+        if self._metrics_collector is None:
+            return ""
+        return self._metrics_collector.get_prometheus_metrics()
