@@ -21,14 +21,25 @@ from aumos_common.errors import NotFoundError, ValidationError
 from aumos_common.observability import get_logger
 
 from aumos_llm_serving.api.schemas import (
+    ABTestCreateRequest,
+    ABTestResponse,
+    AdminDashboardResponse,
+    CacheStatsResponse,
     ChatCompletionRequest,
     ChatCompletionResponse,
     EmbeddingRequest,
     EmbeddingResponse,
+    GuardrailRuleCreateRequest,
+    GuardrailRuleResponse,
     ModelConfigCreateRequest,
     ModelConfigResponse,
     ModelConfigUpdateRequest,
     ModelListResponse,
+    ModelWarmUpRequest,
+    ModelWarmUpResponse,
+    RouterValidationRequest,
+    RouterValidationResponse,
+    StreamingMetricsResponse,
     TenantQuotaRequest,
     TenantQuotaResponse,
     TenantUsageResponse,
@@ -309,6 +320,47 @@ class ServingService:
 
         return ModelListResponse(object="list", data=all_models)
 
+    async def validate_routing(
+        self,
+        tenant_id: uuid.UUID,
+        request: RouterValidationRequest,
+    ) -> RouterValidationResponse:
+        """Dry-run the routing logic to show which model would be selected.
+
+        Args:
+            tenant_id: Tenant context for config lookup.
+            request: Prompt and routing constraints.
+
+        Returns:
+            RouterValidationResponse with selected model and rationale.
+        """
+        estimated_tokens = self._cost_tracker.count_tokens(
+            text=request.prompt,
+            model="gpt-3.5-turbo",
+        )
+
+        mock_request = ChatCompletionRequest(
+            model=request.task_type or self._settings.default_model,
+            messages=[],
+        )
+        provider, model_name = await self._router.route(mock_request, tenant_id)
+        estimated_cost_usd = float(
+            self._cost_tracker.calculate_cost(
+                model=model_name,
+                prompt_tokens=estimated_tokens,
+                completion_tokens=0,
+            )
+        )
+
+        return RouterValidationResponse(
+            selected_model=model_name,
+            selected_provider=provider.provider_name,
+            estimated_prompt_tokens=estimated_tokens,
+            estimated_cost_usd=estimated_cost_usd,
+            routing_reason=f"Routed to {provider.provider_name}/{model_name} based on task_type hint",
+            alternative_models=[],
+        )
+
     async def _enforce_rate_limits(
         self,
         tenant_id: uuid.UUID,
@@ -547,6 +599,59 @@ class CostTrackingService:
             return False
         return True
 
+    async def get_admin_dashboard(self) -> AdminDashboardResponse:
+        """Return platform-wide aggregated metrics for the admin dashboard.
+
+        Returns:
+            AdminDashboardResponse with request and cost aggregates.
+        """
+        from aumos_llm_serving.adapters.repositories import LLMRequestRepository  # noqa: PLC0415
+
+        repo = LLMRequestRepository(self._session)
+        stats = await repo.get_platform_daily_stats()
+
+        return AdminDashboardResponse(
+            total_tenants=stats.get("total_tenants", 0),
+            active_tenants_today=stats.get("active_tenants_today", 0),
+            total_requests_today=stats.get("total_requests_today", 0),
+            total_tokens_today=stats.get("total_tokens_today", 0),
+            total_cost_today_usd=float(stats.get("total_cost_today", 0.0)),
+            requests_by_model=stats.get("requests_by_model", {}),
+            requests_by_provider=stats.get("requests_by_provider", {}),
+            error_rate_pct=float(stats.get("error_rate_pct", 0.0)),
+            avg_latency_ms=float(stats.get("avg_latency_ms", 0.0)),
+        )
+
+    async def get_streaming_metrics(
+        self,
+        tenant_id: uuid.UUID,
+        period_hours: int = 24,
+    ) -> StreamingMetricsResponse:
+        """Return streaming analytics including TTFT percentiles.
+
+        Args:
+            tenant_id: Tenant to query.
+            period_hours: Lookback window in hours.
+
+        Returns:
+            StreamingMetricsResponse with TTFT and throughput metrics.
+        """
+        from aumos_llm_serving.adapters.repositories import LLMRequestRepository  # noqa: PLC0415
+
+        repo = LLMRequestRepository(self._session)
+        stats = await repo.get_streaming_stats(tenant_id, period_hours)
+
+        return StreamingMetricsResponse(
+            tenant_id=tenant_id,
+            period_hours=period_hours,
+            total_streaming_requests=stats.get("total_streaming_requests", 0),
+            total_streaming_tokens=stats.get("total_streaming_tokens", 0),
+            avg_tokens_per_second=float(stats.get("avg_tokens_per_second", 0.0)),
+            p50_ttft_ms=float(stats.get("p50_ttft_ms", 0.0)),
+            p95_ttft_ms=float(stats.get("p95_ttft_ms", 0.0)),
+            p99_ttft_ms=float(stats.get("p99_ttft_ms", 0.0)),
+        )
+
     async def _get_daily_cost(self, tenant_id: uuid.UUID) -> decimal.Decimal:
         """Get total cost spent today for a tenant.
 
@@ -779,6 +884,334 @@ class ModelManagementService:
                 health[name] = False
         return health
 
+    async def create_ab_test(
+        self,
+        tenant_id: uuid.UUID,
+        request: ABTestCreateRequest,
+    ) -> ABTestResponse:
+        """Create a new A/B model testing experiment.
+
+        Args:
+            tenant_id: Tenant to create experiment for.
+            request: Experiment parameters including model pair and traffic split.
+
+        Returns:
+            Created A/B test experiment.
+        """
+        from aumos_llm_serving.adapters.repositories import ABTestRepository  # noqa: PLC0415
+
+        repo = ABTestRepository(self._session)
+        experiment = await repo.create(
+            tenant_id=tenant_id,
+            name=request.name,
+            model_a=request.model_a,
+            model_b=request.model_b,
+            traffic_split_pct=request.traffic_split_pct,
+            evaluation_metric=request.evaluation_metric,
+            sample_size=request.sample_size,
+        )
+
+        logger.info(
+            "A/B test created",
+            tenant_id=str(tenant_id),
+            name=request.name,
+            model_a=request.model_a,
+            model_b=request.model_b,
+        )
+
+        return ABTestResponse.model_validate(experiment)
+
+    async def list_ab_tests(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> list[ABTestResponse]:
+        """List all A/B test experiments for a tenant.
+
+        Args:
+            tenant_id: Tenant to list experiments for.
+
+        Returns:
+            List of A/B test experiments.
+        """
+        from aumos_llm_serving.adapters.repositories import ABTestRepository  # noqa: PLC0415
+
+        repo = ABTestRepository(self._session)
+        experiments = await repo.list_all()
+        return [ABTestResponse.model_validate(e) for e in experiments]
+
+    async def get_ab_test(
+        self,
+        tenant_id: uuid.UUID,
+        test_id: uuid.UUID,
+    ) -> ABTestResponse:
+        """Get a specific A/B test experiment.
+
+        Args:
+            tenant_id: Tenant context (enforced via RLS).
+            test_id: Experiment UUID to retrieve.
+
+        Returns:
+            A/B test experiment.
+
+        Raises:
+            NotFoundError: If experiment does not exist.
+        """
+        from aumos_llm_serving.adapters.repositories import ABTestRepository  # noqa: PLC0415
+
+        repo = ABTestRepository(self._session)
+        experiment = await repo.get(test_id)
+
+        if experiment is None:
+            raise NotFoundError(resource_type="ABTest", resource_id=str(test_id))
+
+        return ABTestResponse.model_validate(experiment)
+
+    async def create_guardrail_rule(
+        self,
+        tenant_id: uuid.UUID,
+        request: GuardrailRuleCreateRequest,
+    ) -> GuardrailRuleResponse:
+        """Create a content guardrail rule for a tenant.
+
+        Args:
+            tenant_id: Tenant to create rule for.
+            request: Guardrail rule parameters.
+
+        Returns:
+            Created guardrail rule.
+        """
+        from aumos_llm_serving.adapters.repositories import GuardrailRepository  # noqa: PLC0415
+
+        repo = GuardrailRepository(self._session)
+        rule = await repo.create(
+            tenant_id=tenant_id,
+            name=request.name,
+            rule_type=request.rule_type,
+            pattern=request.pattern,
+            action=request.action,
+            applies_to=request.applies_to,
+        )
+
+        logger.info(
+            "Guardrail rule created",
+            tenant_id=str(tenant_id),
+            name=request.name,
+            rule_type=request.rule_type,
+            action=request.action,
+        )
+
+        return GuardrailRuleResponse.model_validate(rule)
+
+    async def list_guardrail_rules(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> list[GuardrailRuleResponse]:
+        """List all guardrail rules for a tenant.
+
+        Args:
+            tenant_id: Tenant to list rules for.
+
+        Returns:
+            List of guardrail rules.
+        """
+        from aumos_llm_serving.adapters.repositories import GuardrailRepository  # noqa: PLC0415
+
+        repo = GuardrailRepository(self._session)
+        rules = await repo.list_all()
+        return [GuardrailRuleResponse.model_validate(r) for r in rules]
+
+    async def delete_guardrail_rule(
+        self,
+        tenant_id: uuid.UUID,
+        rule_id: uuid.UUID,
+    ) -> None:
+        """Delete a guardrail rule.
+
+        Args:
+            tenant_id: Tenant context (enforced via RLS).
+            rule_id: Rule UUID to delete.
+
+        Raises:
+            NotFoundError: If rule does not exist.
+        """
+        from aumos_llm_serving.adapters.repositories import GuardrailRepository  # noqa: PLC0415
+
+        repo = GuardrailRepository(self._session)
+        deleted = await repo.delete(rule_id)
+
+        if not deleted:
+            raise NotFoundError(resource_type="GuardrailRule", resource_id=str(rule_id))
+
+        logger.info(
+            "Guardrail rule deleted",
+            tenant_id=str(tenant_id),
+            rule_id=str(rule_id),
+        )
+
+    async def warmup_model(
+        self,
+        tenant_id: uuid.UUID,
+        request: ModelWarmUpRequest,
+    ) -> ModelWarmUpResponse:
+        """Pre-warm a model on a specific provider to reduce cold-start latency.
+
+        Sends a minimal inference request to the target provider so the model
+        is loaded and ready for subsequent production requests.
+
+        Args:
+            tenant_id: Tenant context for audit logging.
+            request: Warm-up parameters including model and provider.
+
+        Returns:
+            Warm-up result with measured latency.
+        """
+        import time as _time  # noqa: PLC0415
+
+        import httpx  # noqa: PLC0415
+
+        provider_name = request.provider
+        start_ms = int(_time.monotonic() * 1000)
+
+        try:
+            if provider_name in self._providers:
+                # Use the registered provider adapter
+                provider = self._providers[provider_name]
+                warmup_req = ChatCompletionRequest(
+                    model=request.model_name,
+                    messages=[{"role": "user", "content": request.sample_prompt}],  # type: ignore[list-item]
+                    max_tokens=1,
+                )
+                await provider.chat_completion(warmup_req, model_override=request.model_name)
+            else:
+                # Unknown provider — attempt a direct HTTP probe
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    endpoint = self._settings.vllm_base_url if provider_name == "vllm" else self._settings.ollama_base_url
+                    await client.get(f"{endpoint}/health")
+
+            latency_ms = int(_time.monotonic() * 1000) - start_ms
+            logger.info(
+                "Model warmed up",
+                model=request.model_name,
+                provider=provider_name,
+                latency_ms=latency_ms,
+            )
+            return ModelWarmUpResponse(
+                model_name=request.model_name,
+                provider=provider_name,
+                latency_ms=latency_ms,
+                success=True,
+            )
+
+        except Exception as exc:
+            latency_ms = int(_time.monotonic() * 1000) - start_ms
+            logger.warning(
+                "Model warm-up failed",
+                model=request.model_name,
+                provider=provider_name,
+                error=str(exc),
+            )
+            return ModelWarmUpResponse(
+                model_name=request.model_name,
+                provider=provider_name,
+                latency_ms=latency_ms,
+                success=False,
+                error=str(exc),
+            )
+
+    async def get_cache_stats(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> list[CacheStatsResponse]:
+        """Retrieve KV cache statistics from all registered providers.
+
+        Queries each provider's metrics endpoint and returns cache hit rate,
+        evictions, and memory utilization.
+
+        Args:
+            tenant_id: Tenant context (used for audit logging).
+
+        Returns:
+            List of CacheStatsResponse, one per provider.
+        """
+        results: list[CacheStatsResponse] = []
+        for provider_name in self._providers:
+            stat = await self._get_single_provider_cache_stats(provider_name)
+            results.append(stat)
+        return results
+
+    async def _get_single_provider_cache_stats(
+        self,
+        provider: str,
+        model_name: str | None = None,
+    ) -> CacheStatsResponse:
+        """Retrieve KV cache statistics from a model provider.
+
+        Queries the provider's metrics endpoint and returns cache hit rate,
+        evictions, and memory utilization.
+
+        Args:
+            provider: Provider name to query (vllm, ollama).
+            model_name: Optional model to filter stats.
+
+        Returns:
+            CacheStatsResponse with memory and hit-rate metrics.
+        """
+        import datetime  # noqa: PLC0415
+
+        import httpx  # noqa: PLC0415
+
+        try:
+            if provider == "vllm":
+                base_url = self._settings.vllm_base_url
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{base_url}/metrics")
+                    raw = response.text
+                # Parse Prometheus text format for KV cache metrics
+                cache_hits = _parse_prometheus_counter(raw, "vllm:gpu_cache_hit_total")
+                cache_misses = _parse_prometheus_counter(raw, "vllm:gpu_cache_miss_total")
+                evictions = _parse_prometheus_counter(raw, "vllm:gpu_cache_eviction_total")
+                mem_used = _parse_prometheus_gauge(raw, "vllm:gpu_cache_usage_perc") * 80.0
+                mem_total = 80.0
+            else:
+                # Ollama does not expose detailed cache metrics — return zeros
+                cache_hits = cache_misses = evictions = 0
+                mem_used = mem_total = 0.0
+
+            total_lookups = cache_hits + cache_misses
+            hit_rate = cache_hits / total_lookups if total_lookups > 0 else 0.0
+
+            return CacheStatsResponse(
+                provider=provider,
+                model_name=model_name,
+                cache_hit_rate=hit_rate,
+                cache_hits=cache_hits,
+                cache_misses=cache_misses,
+                evictions=evictions,
+                memory_used_gb=mem_used,
+                memory_total_gb=mem_total,
+                collected_at=datetime.datetime.utcnow().isoformat(),
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Failed to collect cache stats",
+                provider=provider,
+                error=str(exc),
+            )
+            import datetime as _dt  # noqa: PLC0415
+
+            return CacheStatsResponse(
+                provider=provider,
+                model_name=model_name,
+                cache_hit_rate=0.0,
+                cache_hits=0,
+                cache_misses=0,
+                evictions=0,
+                memory_used_gb=0.0,
+                memory_total_gb=0.0,
+                collected_at=_dt.datetime.utcnow().isoformat(),
+            )
+
     async def set_tenant_quota(
         self,
         tenant_id: uuid.UUID,
@@ -812,6 +1245,48 @@ class ModelManagementService:
         )
 
         return TenantQuotaResponse.model_validate(quota)
+
+
+def _parse_prometheus_counter(text: str, metric_name: str) -> int:
+    """Extract an integer counter value from Prometheus text format.
+
+    Args:
+        text: Raw Prometheus metrics text.
+        metric_name: Metric name to look up.
+
+    Returns:
+        Integer value, or 0 if not found.
+    """
+    for line in text.splitlines():
+        if line.startswith(metric_name) and not line.startswith("#"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(float(parts[-1]))
+                except ValueError:
+                    pass
+    return 0
+
+
+def _parse_prometheus_gauge(text: str, metric_name: str) -> float:
+    """Extract a float gauge value from Prometheus text format.
+
+    Args:
+        text: Raw Prometheus metrics text.
+        metric_name: Metric name to look up.
+
+    Returns:
+        Float value, or 0.0 if not found.
+    """
+    for line in text.splitlines():
+        if line.startswith(metric_name) and not line.startswith("#"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return float(parts[-1])
+                except ValueError:
+                    pass
+    return 0.0
 
 
 class ModelServingOrchestrator:

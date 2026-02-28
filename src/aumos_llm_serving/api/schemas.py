@@ -297,3 +297,201 @@ class TenantUsageResponse(BaseModel):
         if self.monthly_token_limit == 0:
             return 0.0
         return self.monthly_tokens_used / self.monthly_token_limit * 100
+
+
+# =============================================================================
+# AumOS Extensions: Streaming Analytics (Gap #139)
+# =============================================================================
+
+
+class StreamingMetricsResponse(BaseModel):
+    """Per-tenant streaming usage analytics."""
+
+    tenant_id: uuid.UUID
+    period_hours: int
+    total_streaming_requests: int
+    total_streaming_tokens: int
+    avg_tokens_per_second: float
+    p50_ttft_ms: float
+    p95_ttft_ms: float
+    p99_ttft_ms: float
+
+
+# =============================================================================
+# AumOS Extensions: A/B Model Testing (Gap #140)
+# =============================================================================
+
+
+class ABTestCreateRequest(BaseModel):
+    """Request to create an A/B model test experiment."""
+
+    name: str = Field(..., max_length=200, description="Experiment name")
+    model_a: str = Field(..., description="First model identifier")
+    model_b: str = Field(..., description="Second model identifier")
+    traffic_split_pct: int = Field(
+        default=50, ge=1, le=99, description="Percentage of traffic routed to model_a"
+    )
+    evaluation_metric: str = Field(
+        default="latency_ms",
+        description="Primary metric: latency_ms, cost_usd, quality_score",
+    )
+    sample_size: int = Field(default=1000, ge=10, le=100000, description="Target request count per arm")
+
+
+class ABTestResponse(BaseModel):
+    """Response for an A/B test experiment."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    name: str
+    model_a: str
+    model_b: str
+    traffic_split_pct: int
+    evaluation_metric: str
+    sample_size: int
+    requests_a: int
+    requests_b: int
+    avg_metric_a: float | None
+    avg_metric_b: float | None
+    status: str
+    winner: str | None
+    created_at: Any
+
+    model_config = {"from_attributes": True}
+
+
+class ABTestListResponse(BaseModel):
+    """List of A/B test experiments."""
+
+    items: list[ABTestResponse]
+    total: int
+
+
+# =============================================================================
+# AumOS Extensions: Content Guardrails (Gap #141)
+# =============================================================================
+
+
+class GuardrailRuleCreateRequest(BaseModel):
+    """Request to create a content guardrail rule."""
+
+    name: str = Field(..., max_length=200, description="Rule name")
+    rule_type: str = Field(
+        ...,
+        description="Rule type: keyword_block, regex_block, topic_filter, pii_redact",
+    )
+    pattern: str = Field(..., description="Keyword, regex pattern, or topic name to match")
+    action: str = Field(
+        default="block",
+        description="Action on match: block (reject request), redact (replace match), warn (log only)",
+    )
+    applies_to: str = Field(
+        default="both",
+        description="Where to apply: prompt, completion, both",
+    )
+
+
+class GuardrailRuleResponse(BaseModel):
+    """Response for a guardrail rule."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    name: str
+    rule_type: str
+    pattern: str
+    action: str
+    applies_to: str
+    enabled: bool
+    created_at: Any
+
+    model_config = {"from_attributes": True}
+
+
+# =============================================================================
+# AumOS Extensions: Model Warm-Up (Gap #143)
+# =============================================================================
+
+
+class ModelWarmUpRequest(BaseModel):
+    """Request to pre-warm a model on a specific provider."""
+
+    model_name: str = Field(..., description="Model identifier to warm up")
+    provider: str = Field(..., description="Provider to warm: vllm, ollama, litellm")
+    sample_prompt: str = Field(
+        default="Hello",
+        max_length=500,
+        description="Sample prompt to use for the warm-up inference",
+    )
+
+
+class ModelWarmUpResponse(BaseModel):
+    """Result of a model warm-up request."""
+
+    model_name: str
+    provider: str
+    latency_ms: int
+    success: bool
+    error: str | None = None
+
+
+# =============================================================================
+# AumOS Extensions: Cache Monitoring (Gap #144)
+# =============================================================================
+
+
+class CacheStatsResponse(BaseModel):
+    """Response with KV cache statistics for model providers."""
+
+    provider: str
+    model_name: str | None
+    cache_hit_rate: float
+    cache_hits: int
+    cache_misses: int
+    evictions: int
+    memory_used_gb: float
+    memory_total_gb: float
+    collected_at: Any
+
+
+# =============================================================================
+# AumOS Extensions: Admin Dashboard (Gap #137)
+# =============================================================================
+
+
+class AdminDashboardResponse(BaseModel):
+    """Platform-wide admin dashboard data."""
+
+    total_tenants: int
+    active_tenants_today: int
+    total_requests_today: int
+    total_tokens_today: int
+    total_cost_today_usd: float
+    requests_by_model: dict[str, int]
+    requests_by_provider: dict[str, int]
+    error_rate_pct: float
+    avg_latency_ms: float
+
+
+# =============================================================================
+# AumOS Extensions: Complexity Router Validation (Gap #138)
+# =============================================================================
+
+
+class RouterValidationRequest(BaseModel):
+    """Request to validate routing decision for a given prompt."""
+
+    prompt: str = Field(..., max_length=10000, description="Prompt to route")
+    task_type: str | None = Field(default=None, description="Hint: code, embedding, fast, balanced")
+    max_cost_usd: float | None = Field(default=None, ge=0, description="Cost constraint")
+    max_latency_ms: int | None = Field(default=None, ge=1, description="Latency constraint in ms")
+
+
+class RouterValidationResponse(BaseModel):
+    """Result of routing validation showing which model would be selected."""
+
+    selected_model: str
+    selected_provider: str
+    estimated_prompt_tokens: int
+    estimated_cost_usd: float
+    routing_reason: str
+    alternative_models: list[dict[str, Any]]
